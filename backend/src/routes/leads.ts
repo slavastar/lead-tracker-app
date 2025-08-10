@@ -1,3 +1,4 @@
+// backend/src/routes/leads.ts
 import express from "express";
 import { PrismaClient } from "@prisma/client";
 import { encoding_for_model } from "tiktoken";
@@ -13,7 +14,68 @@ const router = express.Router();
 const prisma = new PrismaClient();
 const enc = encoding_for_model("gpt-3.5-turbo");
 
+/**
+ * Simple in-memory rate limiting & concurrency control
+ * NOTE: In-memory works for a single server process. For multiple instances, use Redis.
+ */
+const WINDOW_MS = 60_000;            // sliding window length
+const MAX_REQUESTS_PER_WINDOW = 5;   // max generate requests per user per window
+const MAX_CONCURRENT = 2;            // max concurrent generations per user
+const OPENAI_TIMEOUT_MS = 25_000;    // hard timeout on OpenAI call
 
+type TS = number;
+
+// userId -> timestamps of requests within window
+const requestLog: Map<string, TS[]> = new Map();
+// userId -> current active generation count
+const activeCounts: Map<string, number> = new Map();
+
+function checkAndRecordRate(userId: string): { ok: true } | { ok: false; reason: "RATE_LIMIT" } {
+  const now = Date.now();
+  const arr = requestLog.get(userId) ?? [];
+  // drop old timestamps
+  const recent = arr.filter((t) => now - t < WINDOW_MS);
+  if (recent.length >= MAX_REQUESTS_PER_WINDOW) {
+    requestLog.set(userId, recent);
+    return { ok: false, reason: "RATE_LIMIT" };
+  }
+  recent.push(now);
+  requestLog.set(userId, recent);
+  return { ok: true };
+}
+
+function tryStartJob(userId: string): { ok: true } | { ok: false; reason: "CONCURRENCY_LIMIT" } {
+  const current = activeCounts.get(userId) ?? 0;
+  if (current >= MAX_CONCURRENT) {
+    return { ok: false, reason: "CONCURRENCY_LIMIT" };
+  }
+  activeCounts.set(userId, current + 1);
+  return { ok: true };
+}
+
+function finishJob(userId: string) {
+  const current = activeCounts.get(userId) ?? 0;
+  const next = Math.max(0, current - 1);
+  activeCounts.set(userId, next);
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const id = setTimeout(() => reject(new Error("TIMEOUT")), ms);
+    p.then(
+      (v) => {
+        clearTimeout(id);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(id);
+        reject(e);
+      }
+    );
+  });
+}
+
+// GET /api/leads
 router.get("/", async (_req, res) => {
   try {
     const leads = await prisma.lead.findMany({
@@ -26,7 +88,7 @@ router.get("/", async (_req, res) => {
   }
 });
 
-
+// POST /api/leads
 router.post("/", async (req, res) => {
   const { name, email, company, userId } = req.body;
 
@@ -35,8 +97,8 @@ router.post("/", async (req, res) => {
   }
 
   try {
+    // Ensure user exists
     let user = await prisma.user.findUnique({ where: { id: userId } });
-
     if (!user) {
       user = await prisma.user.create({
         data: {
@@ -48,6 +110,7 @@ router.post("/", async (req, res) => {
       });
     }
 
+    // Create lead
     const lead = await prisma.lead.create({
       data: { name, email, company, userId },
     });
@@ -59,6 +122,7 @@ router.post("/", async (req, res) => {
   }
 });
 
+// GET /api/leads/users/:userId/credits
 router.get("/users/:userId/credits", async (req, res) => {
   const { userId } = req.params;
   try {
@@ -74,12 +138,35 @@ router.get("/users/:userId/credits", async (req, res) => {
   }
 });
 
-
+// POST /api/leads/generate-email
+// optional body: templateKey="cold_email" (default), templateVersion
 router.post("/generate-email", async (req, res) => {
-  const { prompt: user_prompt, lead, language, formality, userId, templateKey = "cold_email", templateVersion } = req.body;
+  const {
+    prompt: user_prompt,
+    lead,
+    language,
+    formality,
+    userId,
+    templateKey = "cold_email",
+    templateVersion,
+  } = req.body;
 
   if (!user_prompt || !lead || !userId || !lead.name || !lead.email) {
     return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  // Rate limit & concurrency checks
+  const rate = checkAndRecordRate(userId);
+  if (!rate.ok) {
+    return res
+      .status(429)
+      .json({ error: "Too many requests. Please wait a moment and try again.", code: "RATE_LIMIT" });
+  }
+  const cx = tryStartJob(userId);
+  if (!cx.ok) {
+    return res
+      .status(429)
+      .json({ error: "Too many active generations. Please wait for current ones to finish.", code: "CONCURRENCY_LIMIT" });
   }
 
   try {
@@ -87,15 +174,23 @@ router.post("/generate-email", async (req, res) => {
     if (!user) return res.status(404).json({ error: "User not found" });
     if (user.credits <= 0) return res.status(403).json({ error: "No credits left" });
 
-    // Pick the template: exact version if provided, else active
+    // Pick template
     const template = templateVersion
-      ? await prisma.promptTemplate.findUnique({ where: { key_version: { key: templateKey, version: Number(templateVersion) } } })
-      : await prisma.promptTemplate.findFirst({ where: { key: templateKey, isActive: true }, orderBy: { version: "desc" } });
+      ? await prisma.promptTemplate.findUnique({
+          where: { key_version: { key: templateKey, version: Number(templateVersion) } },
+        })
+      : await prisma.promptTemplate.findFirst({
+          where: { key: templateKey, isActive: true },
+          orderBy: { version: "desc" },
+        });
 
     if (!template) {
-      return res.status(404).json({ error: `No template found for key "${templateKey}"${templateVersion ? ` v${templateVersion}` : ""}` });
+      return res.status(404).json({
+        error: `No template found for key "${templateKey}"${templateVersion ? ` v${templateVersion}` : ""}`,
+      });
     }
 
+    // Render template
     const vars = {
       lead_name: lead.name,
       lead_email: lead.email,
@@ -103,11 +198,11 @@ router.post("/generate-email", async (req, res) => {
       language,
       formality,
       user_prompt,
-      product_pitch: "We help teams generate high-quality, personalized emails in seconds.", // you can move this to config/db later
+      product_pitch: "We help teams generate high-quality, personalized emails in seconds.",
     };
-
     const finalPrompt = renderTemplate(template.body, vars);
 
+    // Token guard
     const tokenCount = enc.encode(finalPrompt).length;
     if (tokenCount > MAX_TOKENS_PER_REQUEST) {
       return res.status(400).json({
@@ -115,23 +210,29 @@ router.post("/generate-email", async (req, res) => {
       });
     }
 
-    const completion = await openai.chat.completions.create({
-      model: MODEL_NAME,
-      messages: [
-        { role: "system", content: "You are a helpful email assistant." },
-        { role: "user", content: finalPrompt },
-      ],
-      max_tokens: MAX_TOKENS_PER_REQUEST,
-    });
+    // OpenAI call with timeout
+    const completion = await withTimeout(
+      openai.chat.completions.create({
+        model: MODEL_NAME,
+        messages: [
+          { role: "system", content: "You are a helpful email assistant." },
+          { role: "user", content: finalPrompt },
+        ],
+        max_tokens: MAX_TOKENS_PER_REQUEST,
+      }),
+      OPENAI_TIMEOUT_MS
+    );
 
     const generatedEmail = completion.choices[0].message.content?.trim() || "";
 
+    // Deduct credit atomically and return updated count
     const updated = await prisma.user.update({
       where: { id: userId },
       data: { credits: { decrement: 1 } },
       select: { credits: true },
     });
 
+    // Log run
     await prisma.promptRun.create({
       data: {
         userId,
@@ -155,12 +256,22 @@ router.post("/generate-email", async (req, res) => {
       template: { key: template.key, version: template.version, label: template.label },
       tokenCount,
     });
-  } catch (err) {
+  } catch (err: any) {
+    if (err?.message === "TIMEOUT") {
+      console.error("OpenAI timeout");
+      return res.status(504).json({
+        error: "Generation took too long. Please try again.",
+        code: "TIMEOUT",
+      });
+    }
     console.error("Error generating email:", err);
     res.status(500).json({ error: "Failed to generate email" });
+  } finally {
+    finishJob(userId);
   }
 });
 
+// DELETE /api/leads/:id
 router.delete("/:id", async (req, res) => {
   const { id } = req.params;
   try {
