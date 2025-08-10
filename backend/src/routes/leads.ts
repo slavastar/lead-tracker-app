@@ -155,7 +155,7 @@ router.post("/generate-email", async (req, res) => {
     return res.status(400).json({ error: "Missing required fields" });
   }
 
-  // Rate limit & concurrency checks
+  // --- Rate limit & concurrency checks (keep existing helpers) ---
   const rate = checkAndRecordRate(userId);
   if (!rate.ok) {
     return res
@@ -170,11 +170,12 @@ router.post("/generate-email", async (req, res) => {
   }
 
   try {
+    // --- Ensure user + credits ---
     const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user) return res.status(404).json({ error: "User not found" });
     if (user.credits <= 0) return res.status(403).json({ error: "No credits left" });
 
-    // Pick template
+    // --- Pick template (same behavior as before) ---
     const template = templateVersion
       ? await prisma.promptTemplate.findUnique({
           where: { key_version: { key: templateKey, version: Number(templateVersion) } },
@@ -190,7 +191,25 @@ router.post("/generate-email", async (req, res) => {
       });
     }
 
-    // Render template
+    // --- Moderation on raw user prompt ---
+    try {
+      const mod1 = await openai.moderations.create({
+        model: "omni-moderation-latest",
+        input: user_prompt,
+      });
+      const flagged = Array.isArray(mod1.results) && mod1.results.some(r => (r as any).flagged);
+      if (flagged) {
+        return res.status(400).json({
+          error: "The provided prompt was flagged by moderation. Please revise and try again.",
+          code: "MODERATION_FLAGGED_INPUT",
+        });
+      }
+    } catch (e) {
+      // Fail-safe: treat moderation service failure as a soft error
+      return res.status(503).json({ error: "Moderation service unavailable. Please try again later.", code: "MODERATION_UNAVAILABLE" });
+    }
+
+    // --- Render template (unchanged logic) ---
     const vars = {
       lead_name: lead.name,
       lead_email: lead.email,
@@ -202,7 +221,25 @@ router.post("/generate-email", async (req, res) => {
     };
     const finalPrompt = renderTemplate(template.body, vars);
 
-    // Token guard
+    // --- Optional moderation on rendered prompt (safer) ---
+    try {
+      const mod2 = await openai.moderations.create({
+        model: "omni-moderation-latest",
+        input: finalPrompt,
+      });
+      console.log("Final prompt:", finalPrompt)
+      const flagged = Array.isArray(mod2.results) && mod2.results.some(r => (r as any).flagged);
+      if (flagged) {
+        return res.status(400).json({
+          error: "The composed prompt was flagged by moderation. Please adjust inputs and try again.",
+          code: "MODERATION_FLAGGED_RENDERED",
+        });
+      }
+    } catch (e) {
+      return res.status(503).json({ error: "Moderation service unavailable. Please try again later.", code: "MODERATION_UNAVAILABLE" });
+    }
+
+    // --- Token guard (unchanged) ---
     const tokenCount = enc.encode(finalPrompt).length;
     if (tokenCount > MAX_TOKENS_PER_REQUEST) {
       return res.status(400).json({
@@ -210,7 +247,7 @@ router.post("/generate-email", async (req, res) => {
       });
     }
 
-    // OpenAI call with timeout
+    // --- OpenAI call with existing hard timeout ---
     const completion = await withTimeout(
       openai.chat.completions.create({
         model: MODEL_NAME,
@@ -225,14 +262,14 @@ router.post("/generate-email", async (req, res) => {
 
     const generatedEmail = completion.choices[0].message.content?.trim() || "";
 
-    // Deduct credit atomically and return updated count
+    // --- Deduct 1 credit atomically ---
     const updated = await prisma.user.update({
       where: { id: userId },
       data: { credits: { decrement: 1 } },
       select: { credits: true },
     });
 
-    // Log run
+    // --- Log the run (unchanged) ---
     await prisma.promptRun.create({
       data: {
         userId,
@@ -250,7 +287,7 @@ router.post("/generate-email", async (req, res) => {
       },
     });
 
-    res.json({
+    return res.json({
       email: generatedEmail,
       creditsLeft: updated.credits,
       template: { key: template.key, version: template.version, label: template.label },
@@ -258,15 +295,15 @@ router.post("/generate-email", async (req, res) => {
     });
   } catch (err: any) {
     if (err?.message === "TIMEOUT") {
-      console.error("OpenAI timeout");
       return res.status(504).json({
         error: "Generation took too long. Please try again.",
         code: "TIMEOUT",
       });
     }
     console.error("Error generating email:", err);
-    res.status(500).json({ error: "Failed to generate email" });
+    return res.status(500).json({ error: "Failed to generate email" });
   } finally {
+    // Always release concurrency slot
     finishJob(userId);
   }
 });
