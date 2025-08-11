@@ -16,7 +16,8 @@ export const GenerateEmailPage: React.FC = () => {
   const [prompt, setPrompt] = useState("");
   const [language, setLanguage] = useState("english");
   const [formality, setFormality] = useState("formal");
-  const [generatedEmail, setGeneratedEmail] = useState("");
+  const [subject, setSubject] = useState("");
+  const [body, setBody] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [creditsLeft, setCreditsLeft] = useState(0);
@@ -34,11 +35,10 @@ export const GenerateEmailPage: React.FC = () => {
         setUserId(data.user.id);
       }
     };
-
     fetchUser();
   }, []);
 
-  // Fetch the lead and user's credits once userId and leadId are available
+  // Fetch the lead + credits
   useEffect(() => {
     if (!userId || !leadId) return;
 
@@ -70,14 +70,14 @@ export const GenerateEmailPage: React.FC = () => {
   const handleGenerate = async () => {
     setLoading(true);
     setError("");
-    setGeneratedEmail("");
+    setSubject("");
+    setBody("");
 
     if (!userId) {
       setError("User not authenticated");
       setLoading(false);
       return;
     }
-
     if (!lead) {
       setError("Lead data is missing");
       setLoading(false);
@@ -97,14 +97,27 @@ export const GenerateEmailPage: React.FC = () => {
         }),
       });
 
+      // Handle non-OKs (including moderation/timeout/errors)
       if (!res.ok) {
-        const errData = await res.json();
+        const errData = await res.json().catch(() => ({}));
         throw new Error(errData.error || "Failed to generate email");
       }
 
       const data = await res.json();
-      setGeneratedEmail(data.email);
-      setCreditsLeft(data.creditsLeft);
+
+      // New structured response
+      if (data.subject && data.body) {
+        setSubject(data.subject);
+        setBody(data.body);
+      } else if (data.email) {
+        // Fallback to old single 'email' field if backend ever returns it
+        setSubject("Generated Email");
+        setBody(data.email);
+      }
+
+      if (typeof data.creditsLeft === "number") {
+        setCreditsLeft(data.creditsLeft);
+      }
     } catch (err: any) {
       console.error(err);
       setError(err.message || "Unknown error");
@@ -123,15 +136,9 @@ export const GenerateEmailPage: React.FC = () => {
 
       {lead ? (
         <div className="mb-6 p-4 border rounded bg-gray-100">
-          <p>
-            <strong>Name:</strong> {lead.name}
-          </p>
-          <p>
-            <strong>Email:</strong> {lead.email}
-          </p>
-          <p>
-            <strong>Company:</strong> {lead.company || "-"}
-          </p>
+          <p><strong>Name:</strong> {lead.name}</p>
+          <p><strong>Email:</strong> {lead.email}</p>
+          <p><strong>Company:</strong> {lead.company || "-"}</p>
         </div>
       ) : (
         <p>Loading lead data...</p>
@@ -194,10 +201,15 @@ export const GenerateEmailPage: React.FC = () => {
 
       {error && <p className="mt-4 text-red-600">{error}</p>}
 
-      {generatedEmail && (
+      {(subject || body) && (
         <div className="mt-6 p-4 border rounded bg-green-50 whitespace-pre-line">
-          <h2 className="text-lg font-semibold mb-2">Generated Email:</h2>
-          <p>{generatedEmail}</p>
+          <h2 className="text-lg font-semibold mb-2">Generated Email</h2>
+          {subject && (
+            <p className="mb-2">
+              <strong>Subject:</strong> {subject}
+            </p>
+          )}
+          {body && <pre className="whitespace-pre-wrap">{body}</pre>}
         </div>
       )}
     </div>

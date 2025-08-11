@@ -9,6 +9,7 @@ import {
   DEFAULT_CREDITS,
 } from "../config/config";
 import { renderTemplate } from "../utils/renderTemplate";
+import { z } from "zod";
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -33,7 +34,6 @@ const activeCounts: Map<string, number> = new Map();
 function checkAndRecordRate(userId: string): { ok: true } | { ok: false; reason: "RATE_LIMIT" } {
   const now = Date.now();
   const arr = requestLog.get(userId) ?? [];
-  // drop old timestamps
   const recent = arr.filter((t) => now - t < WINDOW_MS);
   if (recent.length >= MAX_REQUESTS_PER_WINDOW) {
     requestLog.set(userId, recent);
@@ -74,6 +74,12 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
     );
   });
 }
+
+// Zod schema for AI output
+const EmailSchema = z.object({
+  subject: z.string().min(1, "Subject is required").max(200, "Subject must be <= 200 characters"),
+  body: z.string().min(10, "Body is too short"),
+});
 
 // GET /api/leads
 router.get("/", async (_req, res) => {
@@ -155,7 +161,7 @@ router.post("/generate-email", async (req, res) => {
     return res.status(400).json({ error: "Missing required fields" });
   }
 
-  // --- Rate limit & concurrency checks (keep existing helpers) ---
+  // --- Rate limit & concurrency checks ---
   const rate = checkAndRecordRate(userId);
   if (!rate.ok) {
     return res
@@ -175,7 +181,7 @@ router.post("/generate-email", async (req, res) => {
     if (!user) return res.status(404).json({ error: "User not found" });
     if (user.credits <= 0) return res.status(403).json({ error: "No credits left" });
 
-    // --- Pick template (same behavior as before) ---
+    // --- Pick template ---
     const template = templateVersion
       ? await prisma.promptTemplate.findUnique({
           where: { key_version: { key: templateKey, version: Number(templateVersion) } },
@@ -197,19 +203,18 @@ router.post("/generate-email", async (req, res) => {
         model: "omni-moderation-latest",
         input: user_prompt,
       });
-      const flagged = Array.isArray(mod1.results) && mod1.results.some(r => (r as any).flagged);
+      const flagged = Array.isArray(mod1.results) && mod1.results.some((r) => (r as any).flagged);
       if (flagged) {
         return res.status(400).json({
           error: "The provided prompt was flagged by moderation. Please revise and try again.",
           code: "MODERATION_FLAGGED_INPUT",
         });
       }
-    } catch (e) {
-      // Fail-safe: treat moderation service failure as a soft error
+    } catch {
       return res.status(503).json({ error: "Moderation service unavailable. Please try again later.", code: "MODERATION_UNAVAILABLE" });
     }
 
-    // --- Render template (unchanged logic) ---
+    // --- Render template ---
     const vars = {
       lead_name: lead.name,
       lead_email: lead.email,
@@ -221,25 +226,24 @@ router.post("/generate-email", async (req, res) => {
     };
     const finalPrompt = renderTemplate(template.body, vars);
 
-    // --- Optional moderation on rendered prompt (safer) ---
+    // --- Moderation on rendered prompt (optional but safer) ---
     try {
       const mod2 = await openai.moderations.create({
         model: "omni-moderation-latest",
         input: finalPrompt,
       });
-      console.log("Final prompt:", finalPrompt)
-      const flagged = Array.isArray(mod2.results) && mod2.results.some(r => (r as any).flagged);
+      const flagged = Array.isArray(mod2.results) && mod2.results.some((r) => (r as any).flagged);
       if (flagged) {
         return res.status(400).json({
           error: "The composed prompt was flagged by moderation. Please adjust inputs and try again.",
           code: "MODERATION_FLAGGED_RENDERED",
         });
       }
-    } catch (e) {
+    } catch {
       return res.status(503).json({ error: "Moderation service unavailable. Please try again later.", code: "MODERATION_UNAVAILABLE" });
     }
 
-    // --- Token guard (unchanged) ---
+    // --- Token guard ---
     const tokenCount = enc.encode(finalPrompt).length;
     if (tokenCount > MAX_TOKENS_PER_REQUEST) {
       return res.status(400).json({
@@ -247,29 +251,73 @@ router.post("/generate-email", async (req, res) => {
       });
     }
 
-    // --- OpenAI call with existing hard timeout ---
+    // --- Ask the model for STRICT JSON (subject + body). ---
+    // We instruct the model to reply ONLY with JSON. We'll still validate with Zod.
+    const jsonInstruction = `
+You are an expert email copywriter.
+Return ONLY valid JSON with the following shape, no prose, no markdown:
+
+{
+  "subject": string (<= 200 chars),
+  "body": string
+}
+
+Constraints:
+- Subject must be concise (<= 200 chars).
+- Body should be a short, professional cold email.
+- Do not include any additional fields.
+- Do not include backticks or code fences.
+`;
+
+    const userContent = `${finalPrompt}
+
+Return only JSON for { "subject", "body" } as specified above.`;
+
     const completion = await withTimeout(
       openai.chat.completions.create({
         model: MODEL_NAME,
         messages: [
-          { role: "system", content: "You are a helpful email assistant." },
-          { role: "user", content: finalPrompt },
+          { role: "system", content: jsonInstruction },
+          { role: "user", content: userContent },
         ],
         max_tokens: MAX_TOKENS_PER_REQUEST,
+        temperature: 0.7,
       }),
       OPENAI_TIMEOUT_MS
     );
 
-    const generatedEmail = completion.choices[0].message.content?.trim() || "";
+    const raw = completion.choices[0]?.message?.content ?? "";
+    // Attempt to parse JSON safely
+    let parsed: unknown;
+    try {
+      // Some models sometimes wrap JSON in fences—strip common fences just in case
+      const cleaned = raw.trim().replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "");
+      parsed = JSON.parse(cleaned);
+    } catch (e) {
+      console.error("Model did not return valid JSON:", raw);
+      return res.status(502).json({ error: "Model returned invalid JSON.", code: "MODEL_BAD_JSON" });
+    }
 
-    // --- Deduct 1 credit atomically ---
+    // Zod validation (subject <= 200)
+    const result = EmailSchema.safeParse(parsed);
+    if (!result.success) {
+      return res.status(422).json({
+        error: "Model JSON failed validation.",
+        code: "MODEL_BAD_SCHEMA",
+        issues: result.error.issues,
+      });
+    }
+
+    const { subject, body } = result.data;
+
+    // --- Deduct credit atomically ---
     const updated = await prisma.user.update({
       where: { id: userId },
       data: { credits: { decrement: 1 } },
       select: { credits: true },
     });
 
-    // --- Log the run (unchanged) ---
+    // --- Log the run ---
     await prisma.promptRun.create({
       data: {
         userId,
@@ -283,12 +331,13 @@ router.post("/generate-email", async (req, res) => {
         finalPrompt,
         model: MODEL_NAME,
         tokenCount,
-        response: generatedEmail,
+        response: { subject, body }, // store structured response
       },
     });
 
     return res.json({
-      email: generatedEmail,
+      subject,
+      body,
       creditsLeft: updated.credits,
       template: { key: template.key, version: template.version, label: template.label },
       tokenCount,
@@ -303,7 +352,6 @@ router.post("/generate-email", async (req, res) => {
     console.error("Error generating email:", err);
     return res.status(500).json({ error: "Failed to generate email" });
   } finally {
-    // Always release concurrency slot
     finishJob(userId);
   }
 });
