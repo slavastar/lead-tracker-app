@@ -24,7 +24,6 @@ export const GenerateEmailPage: React.FC = () => {
   const [tokenValid, setTokenValid] = useState(true);
   const [userId, setUserId] = useState<string | null>(null);
 
-  // Fetch the authenticated user ID
   useEffect(() => {
     const fetchUser = async () => {
       const { data, error } = await supabase.auth.getUser();
@@ -38,7 +37,6 @@ export const GenerateEmailPage: React.FC = () => {
     fetchUser();
   }, []);
 
-  // Fetch the lead + credits
   useEffect(() => {
     if (!userId || !leadId) return;
 
@@ -97,7 +95,6 @@ export const GenerateEmailPage: React.FC = () => {
         }),
       });
 
-      // Handle non-OKs (including moderation/timeout/errors)
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         throw new Error(errData.error || "Failed to generate email");
@@ -105,12 +102,10 @@ export const GenerateEmailPage: React.FC = () => {
 
       const data = await res.json();
 
-      // New structured response
       if (data.subject && data.body) {
         setSubject(data.subject);
         setBody(data.body);
       } else if (data.email) {
-        // Fallback to old single 'email' field if backend ever returns it
         setSubject("Generated Email");
         setBody(data.email);
       }

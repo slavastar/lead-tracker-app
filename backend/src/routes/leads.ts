@@ -1,4 +1,3 @@
-// backend/src/routes/leads.ts
 import express from "express";
 import { PrismaClient } from "@prisma/client";
 import { encoding_for_model } from "tiktoken";
@@ -15,20 +14,14 @@ const router = express.Router();
 const prisma = new PrismaClient();
 const enc = encoding_for_model("gpt-3.5-turbo");
 
-/**
- * Simple in-memory rate limiting & concurrency control
- * NOTE: In-memory works for a single server process. For multiple instances, use Redis.
- */
-const WINDOW_MS = 60_000;            // sliding window length
-const MAX_REQUESTS_PER_WINDOW = 5;   // max generate requests per user per window
-const MAX_CONCURRENT = 2;            // max concurrent generations per user
-const OPENAI_TIMEOUT_MS = 25_000;    // hard timeout on OpenAI call
+const WINDOW_MS = 60_000;
+const MAX_REQUESTS_PER_WINDOW = 5;
+const MAX_CONCURRENT = 2;
+const OPENAI_TIMEOUT_MS = 25_000;
 
 type TS = number;
 
-// userId -> timestamps of requests within window
 const requestLog: Map<string, TS[]> = new Map();
-// userId -> current active generation count
 const activeCounts: Map<string, number> = new Map();
 
 function checkAndRecordRate(userId: string): { ok: true } | { ok: false; reason: "RATE_LIMIT" } {
@@ -75,13 +68,11 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-// Zod schema for AI output
 const EmailSchema = z.object({
   subject: z.string().min(1, "Subject is required").max(200, "Subject must be <= 200 characters"),
   body: z.string().min(10, "Body is too short"),
 });
 
-// GET /api/leads
 router.get("/", async (_req, res) => {
   try {
     const leads = await prisma.lead.findMany({
@@ -94,7 +85,6 @@ router.get("/", async (_req, res) => {
   }
 });
 
-// POST /api/leads
 router.post("/", async (req, res) => {
   const { name, email, company, userId } = req.body;
 
@@ -103,7 +93,6 @@ router.post("/", async (req, res) => {
   }
 
   try {
-    // Ensure user exists
     let user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user) {
       user = await prisma.user.create({
@@ -116,7 +105,6 @@ router.post("/", async (req, res) => {
       });
     }
 
-    // Create lead
     const lead = await prisma.lead.create({
       data: { name, email, company, userId },
     });
@@ -128,7 +116,6 @@ router.post("/", async (req, res) => {
   }
 });
 
-// GET /api/leads/users/:userId/credits
 router.get("/users/:userId/credits", async (req, res) => {
   const { userId } = req.params;
   try {
@@ -144,8 +131,7 @@ router.get("/users/:userId/credits", async (req, res) => {
   }
 });
 
-// POST /api/leads/generate-email
-// optional body: templateKey="cold_email" (default), templateVersion
+
 router.post("/generate-email", async (req, res) => {
   const {
     prompt: user_prompt,
@@ -161,7 +147,6 @@ router.post("/generate-email", async (req, res) => {
     return res.status(400).json({ error: "Missing required fields" });
   }
 
-  // --- Rate limit & concurrency checks ---
   const rate = checkAndRecordRate(userId);
   if (!rate.ok) {
     return res
@@ -176,12 +161,10 @@ router.post("/generate-email", async (req, res) => {
   }
 
   try {
-    // --- Ensure user + credits ---
     const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user) return res.status(404).json({ error: "User not found" });
     if (user.credits <= 0) return res.status(403).json({ error: "No credits left" });
 
-    // --- Pick template ---
     const template = templateVersion
       ? await prisma.promptTemplate.findUnique({
           where: { key_version: { key: templateKey, version: Number(templateVersion) } },
@@ -197,7 +180,6 @@ router.post("/generate-email", async (req, res) => {
       });
     }
 
-    // --- Moderation on raw user prompt ---
     try {
       const mod1 = await openai.moderations.create({
         model: "omni-moderation-latest",
@@ -214,7 +196,6 @@ router.post("/generate-email", async (req, res) => {
       return res.status(503).json({ error: "Moderation service unavailable. Please try again later.", code: "MODERATION_UNAVAILABLE" });
     }
 
-    // --- Render template ---
     const vars = {
       lead_name: lead.name,
       lead_email: lead.email,
@@ -226,7 +207,6 @@ router.post("/generate-email", async (req, res) => {
     };
     const finalPrompt = renderTemplate(template.body, vars);
 
-    // --- Moderation on rendered prompt (optional but safer) ---
     try {
       const mod2 = await openai.moderations.create({
         model: "omni-moderation-latest",
@@ -243,7 +223,6 @@ router.post("/generate-email", async (req, res) => {
       return res.status(503).json({ error: "Moderation service unavailable. Please try again later.", code: "MODERATION_UNAVAILABLE" });
     }
 
-    // --- Token guard ---
     const tokenCount = enc.encode(finalPrompt).length;
     if (tokenCount > MAX_TOKENS_PER_REQUEST) {
       return res.status(400).json({
@@ -251,8 +230,6 @@ router.post("/generate-email", async (req, res) => {
       });
     }
 
-    // --- Ask the model for STRICT JSON (subject + body). ---
-    // We instruct the model to reply ONLY with JSON. We'll still validate with Zod.
     const jsonInstruction = `
 You are an expert email copywriter.
 Return ONLY valid JSON with the following shape, no prose, no markdown:
@@ -287,10 +264,8 @@ Return only JSON for { "subject", "body" } as specified above.`;
     );
 
     const raw = completion.choices[0]?.message?.content ?? "";
-    // Attempt to parse JSON safely
     let parsed: unknown;
     try {
-      // Some models sometimes wrap JSON in fences—strip common fences just in case
       const cleaned = raw.trim().replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "");
       parsed = JSON.parse(cleaned);
     } catch (e) {
@@ -298,7 +273,6 @@ Return only JSON for { "subject", "body" } as specified above.`;
       return res.status(502).json({ error: "Model returned invalid JSON.", code: "MODEL_BAD_JSON" });
     }
 
-    // Zod validation (subject <= 200)
     const result = EmailSchema.safeParse(parsed);
     if (!result.success) {
       return res.status(422).json({
@@ -310,14 +284,12 @@ Return only JSON for { "subject", "body" } as specified above.`;
 
     const { subject, body } = result.data;
 
-    // --- Deduct credit atomically ---
     const updated = await prisma.user.update({
       where: { id: userId },
       data: { credits: { decrement: 1 } },
       select: { credits: true },
     });
 
-    // --- Log the run ---
     await prisma.promptRun.create({
       data: {
         userId,
@@ -331,7 +303,7 @@ Return only JSON for { "subject", "body" } as specified above.`;
         finalPrompt,
         model: MODEL_NAME,
         tokenCount,
-        response: { subject, body }, // store structured response
+        response: { subject, body },
       },
     });
 
@@ -356,7 +328,6 @@ Return only JSON for { "subject", "body" } as specified above.`;
   }
 });
 
-// DELETE /api/leads/:id
 router.delete("/:id", async (req, res) => {
   const { id } = req.params;
   try {

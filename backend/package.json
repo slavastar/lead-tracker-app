@@ -5,6 +5,9 @@
   "scripts": {
     "dev": "ts-node-dev --respawn src/index.ts"
   },
+  "prisma": {
+    "seed": "ts-node --transpile-only prisma/seed.ts"
+  },
   "dependencies": {
     "@prisma/client": "^6.13.0",
     "chart.js": "^4.5.0",
