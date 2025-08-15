@@ -48,43 +48,31 @@ The following features have been implemented:
 - Purchase credits via Stripe
 - View credits on the dashboard with Chart.js
 - All data stored in Supabase with schema defined using Prisma and RLS enabled for secure access
+- Prompt logging & versioning
+- Prompt moderation & validation using Zod
 
 ---
 
 ## Run the app
 
-### 0) Prerequisites
+## 1) Create environment variables
 
-- Node.js 18+ and npm
-- A Supabase project (for Postgres)
-- An OpenAI API key
-- A Stripe test account (with a **Price** created)
+### `frontend/.env`
 
-**Install dependencies in both apps first:**
-```bash
-cd frontend && npm install
-cd ../backend && npm install
+```env
+REACT_APP_API_URL=http://localhost:4000
+REACT_APP_SUPABASE_URL=http://localhost:54321
+REACT_APP_SUPABASE_ANON_KEY=your-anon-key-here
 ```
 
----
+### `backend/.env`
 
-### 1) Environment variables
-
-Create the following files **before** starting the servers.
-
-**`frontend/.env`**
 ```env
-REACT_APP_SUPABASE_URL=https://<PROJECT_ID>.supabase.co
-REACT_APP_SUPABASE_ANON_KEY=
-```
-
-**`backend/.env`**
-```env
-DATABASE_URL=postgresql://postgres:<PASSWORD>@db.<PROJECT_ID>.supabase.co:5432/postgres
-OPENAI_API_KEY=...
+DATABASE_URL=postgresql://postgres:postgres@host.docker.internal:54322/postgres
+OPENAI_API_KEY=sk-proj-...
 
 STRIPE_SECRET_KEY=sk_test_...
-STRIPE_PRICE_ID=price_...
+STRIPE_PRICE_ID=price_1...
 STRIPE_WEBHOOK_SECRET=whsec_...
 
 FRONTEND_URL=http://localhost:3000
@@ -92,36 +80,35 @@ FRONTEND_URL=http://localhost:3000
 
 ---
 
-### 2) Initialize Prisma (database schema on Supabase)
+## 2) Launching the app (local development)
 
-From the **backend** folder:
+In the root project folder, run:
+
 ```bash
-npx prisma generate
-npx prisma migrate dev --name init
-```
-Or to push schema without migrations:
-```bash
-npx prisma db push
+# Build & start frontend + backend
+docker compose --env-file ./frontend/.env up --build
+
+# Start local Supabase
+supabase start
+
+# Start Stripe webhook listener
+stripe listen --forward-to localhost:4000/api/webhook
 ```
 
 ---
 
-### 3) Start the servers
+## 3) Database (Prisma + Supabase)
 
-**Frontend** (http://localhost:3000)
-```bash
-cd frontend
-npm start
-```
+The backend uses [Prisma](https://www.prisma.io/) ORM with Supabase Postgres.
 
-**Backend** (http://localhost:4000)
-```bash
-cd backend
-npm run dev
-```
+### Generate Prisma client
 
-**Stripe Webhook**
+Whenever you change `prisma/schema.prisma`:
+
 ```bash
 cd backend
-stripe listen --forward-to localhost:4000/api/webhook
+npx prisma generate
 ```
+
+### 4) Run the app
+The app is running on [http://localhost:3000](http://localhost:3000)

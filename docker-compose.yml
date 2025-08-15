@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - ./backend/.env
+    ports:
+      - "4000:4000"
+    restart: unless-stopped
+    depends_on: []
+    # If you're using Supabase locally via CLI, ensure DATABASE_URL points to host.docker.internal:54322
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        REACT_APP_SUPABASE_URL: ${REACT_APP_SUPABASE_URL}
+        REACT_APP_SUPABASE_ANON_KEY: ${REACT_APP_SUPABASE_ANON_KEY}
+    env_file:
+      - ./frontend/.env
+    ports:
+      - "3000:80" # nginx serves the built frontend on port 80 inside the container
+    restart: unless-stopped
+    depends_on:
+      - backend
