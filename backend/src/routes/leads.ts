@@ -232,8 +232,11 @@ router.post("/generate-email", async (req, res) => {
 
     const jsonInstruction = `
 You are an expert email copywriter.
-Return ONLY valid JSON with the following shape, no prose, no markdown:
 
+Always write the email in: ${language}
+Always use this tone: ${formality}
+
+Return ONLY valid JSON with the following shape, no prose, no markdown:
 {
   "subject": string (<= 200 chars),
   "body": string

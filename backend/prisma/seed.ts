@@ -10,6 +10,8 @@ async function main() {
       label: 'Short formal intro',
       isActive: true,
       body: `
+Write a {{formality}} cold email in {{language}} to {{lead_name}} at {{lead_company}} ({{lead_email}}).
+
 Context:
 - Your role/product: {{product_pitch}}
 - Receiver: {{lead_name}} ({{lead_email}}) at {{lead_company}}
@@ -26,7 +28,7 @@ Constraints:
 User instructions:
 {{user_prompt}}
 
-Write a subject and body only.`
+Return subject and body only.`
     },
     {
       key,
